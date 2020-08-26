@@ -14,9 +14,7 @@
 #include <sys/types.h>
 #include <linux/userfaultfd.h>
 #include <unistd.h>
-
-// See comment in the header for more info
-#include "uffd_missing_header_bits.hpp"
+#include <string.h>
 
 ////////////////////////////////////////////////////////////////////
 // userfaultfd Write Protection Test
@@ -60,13 +58,19 @@
 //
 ////////////////////////////////////////////////////////////////////
 
+enum test_mode {
+    M_UFFD_WP,
+    M_UFFD_WP_SIGBUS,
+    M_MPROTECT,
+};
+
 static const int PAGE_SIZE = 4096;
-static const int PAGE_COUNT = 5000000;
+static const int PAGE_COUNT = 4096;
 static const uint64_t ALLOC_SIZE = (uint64_t)PAGE_SIZE * PAGE_COUNT;
 
 // Use a char per page for now. The wasted memory isn't really of interest
 // for this experiment;
-static char* PAGE_TRACKER;
+static char PAGE_TRACKER[PAGE_COUNT];
 
 // Used for tracking the start of the desired region. Think of this like
 // a heap base for GC.
@@ -75,12 +79,26 @@ static char* PAGE_TRACKER;
 static void* REGION_BASE;
 
 // Choose one to use for measuring elapsed time
-#define USE_RDTSC 0
-#define USE_CHRONO 1
-static_assert(USE_CHRONO || USE_RDTSC, "Must specify clock to use for timing!");
+#define USE_RDTSC 1
+#define USE_CHRONO 0
+static_assert(USE_RDTSC, "Must specify RDTSC for delay tracking!");
+
+struct fault_delay {
+    uint64_t worker_write;
+    uint64_t uffd_receive;
+    uint64_t uffd_resolve;
+    uint64_t worker_finish;
+};
+static struct fault_delay FAULT_DELAY[PAGE_COUNT];
 
 // Aren't they?
 #define EXTRA_CHECKS_ARE_FUN 0
+
+uint64_t rdtsc(){
+    unsigned int lo,hi;
+    __asm__ __volatile__ ("rdtsc" : "=a" (lo), "=d" (hi));
+    return ((uint64_t)hi << 32) | lo;
+}
 
 void* allocate_mem_with_mmap(size_t num_bytes)
 {
@@ -99,28 +117,18 @@ void* allocate_mem_with_mmap(size_t num_bytes)
     return addr;
 }
 
-int fill_with_pattern_seq(void* addr, char pattern, uint64_t len_bytes)
+int fill_with_pattern_seq(void* addr, char pattern, uint64_t pages,
+                          bool timestamp)
 {
     char* cur = (char*)addr;
-    for (uint64_t i = 0; i < len_bytes; i++)
+    for (uint64_t i = 0; i < pages; i++)
     {
+        if (timestamp)
+            FAULT_DELAY[i].worker_write = rdtsc();
         *cur = pattern;
-        cur++;
-    }
-
-    return 0;
-}
-
-int n_random_writes(void* addr, char pattern, uint64_t len_bytes, int num_writes)
-{
-    srand(1337);
-
-    for (int i = 0; i < num_writes; i++)
-    {
-        int byte_to_set = rand() % len_bytes;
-        char* cur = (char*)((uint64_t)addr + byte_to_set);
-        *cur = pattern;
-        cur++;
+        if (timestamp)
+            FAULT_DELAY[i].worker_finish = rdtsc();
+        cur += PAGE_SIZE;
     }
 
     return 0;
@@ -183,7 +191,8 @@ int resume_with_mprotect_rw(void* addr, uint64_t length)
 }
 
 // Register a range of memory for use with UFFD WP
-int register_range_with_wp(int uffd, void* addr, uint64_t length)
+int register_range_with_wp(int uffd, void* addr, uint64_t length,
+                           bool sigbus)
 {
     struct uffdio_range range = {
         (__u64)addr, 
@@ -208,33 +217,49 @@ int register_range_with_wp(int uffd, void* addr, uint64_t length)
     return ret;
 }
 
+static int page_number_global;
+static int uffd_global;
+
 // In a real runtime, this would have to do some extra work to determine whether
 // this is a "real" segfault or just the write tracking signal and handle it
 // accordingly. We're skipping all that stuff here since we always assume this
 // is going to be a write protection fault we caused intentionally.
-void sigsegv_handler(int code, siginfo_t *siginfo, void *context)
+void sig_handler(int code, siginfo_t *siginfo, void *context)
 {
-    size_t addr = (size_t)siginfo->si_addr;
-    // printf("Yay, SIGSEGV handler caught a write at %p\n", (void*)addr);
+    size_t addr;
+    int page_number;
+
+    if (code == SIGSEGV) {
+        addr = (size_t)siginfo->si_addr;
+        page_number = (addr - (uint64_t)REGION_BASE) / PAGE_SIZE;
+    } else if (code == SIGBUS) {
+        addr = (uint64_t)REGION_BASE + PAGE_SIZE * page_number_global;
+        page_number = page_number_global++;
+    }
 
     // Dirty the page in our tracker
-    int page_number = (addr - (uint64_t)REGION_BASE) / PAGE_SIZE;
+    FAULT_DELAY[page_number].uffd_receive = rdtsc();
     PAGE_TRACKER[page_number] = (char)1;
 
-    resume_with_mprotect_rw((void*)addr, PAGE_SIZE);
+    if (code == SIGSEGV) {
+        resume_with_mprotect_rw((void*)addr, PAGE_SIZE);
+    } else if (code == SIGBUS) {
+        resume_without_wp(uffd_global, (void*)addr, PAGE_SIZE);
+    }
+    FAULT_DELAY[page_number].uffd_resolve = rdtsc();
 }
 
-void register_segv_handler()
+void register_handler(int sig)
 {
     struct sigaction action;
 
     action.sa_flags = SA_RESTART;
     action.sa_handler = NULL;
-    action.sa_sigaction = sigsegv_handler;
+    action.sa_sigaction = sig_handler;
     action.sa_flags |= SA_SIGINFO;
     sigemptyset(&action.sa_mask);
 
-    int ret = sigaction(SIGSEGV, &action, nullptr);
+    int ret = sigaction(sig, &action, nullptr);
     if (ret != 0)
     {
         printf("sigaction failed with %d. errno: %d\n", ret, errno);
@@ -302,6 +327,8 @@ void* listener_proc(void* arg)
             int page_number = (fault_addr - (uint64_t)REGION_BASE) / (uint64_t)PAGE_SIZE;
             PAGE_TRACKER[page_number] = (char)1;
 
+            FAULT_DELAY[page_number].uffd_receive = rdtsc();
+
             // Now you send ioctl(uffd, UFFDIO_WRITEPROTECT, struct *uffdio_writeprotect)
             // again while pagefault.mode does not have UFFDIO_WRITEPROTECT_MODE_WP set.
             // This wakes up the thread which will continue to run with writes. This allows
@@ -312,6 +339,7 @@ void* listener_proc(void* arg)
             {
                 printf("Resume failed!: %d\n", ret);
             }
+            FAULT_DELAY[page_number].uffd_resolve = rdtsc();
         }
         else
         {
@@ -323,15 +351,15 @@ void* listener_proc(void* arg)
 }
 
 // TODO: proper handling of ret values
-int set_up_segv_way(void* buf, uint64_t alloc_size)
+int set_up_way(void* buf, uint64_t alloc_size)
 {
-    register_segv_handler();
+    register_handler(SIGSEGV);
     REGION_BASE = buf;
     return protect_range_with_mprotect(buf, alloc_size);
 }
 
 // TODO: proper handling of ret values
-int set_up_uffd_way(void* buf, uint64_t alloc_size)
+int set_up_uffd_way(void* buf, uint64_t alloc_size, bool sigbus)
 {
     REGION_BASE = buf;
     int fd = 0;
@@ -347,7 +375,10 @@ int set_up_uffd_way(void* buf, uint64_t alloc_size)
     // a later API version) which will specify the ``read/POLLIN`` protocol
     // userland intends to speak on the ``UFFD`` and the ``uffdio_api.features``
     // userland requires.
-    struct uffdio_api api = { .api = UFFD_API };
+    struct uffdio_api api = {
+        .api = UFFD_API,
+        .features = (unsigned long long)(sigbus ? UFFD_FEATURE_SIGBUS : 0),
+    };
 
     // The ``UFFDIO_API`` ioctl if successful (i.e. if the
     // requested ``uffdio_api.api`` is spoken also by the running kernel and the
@@ -376,38 +407,45 @@ int set_up_uffd_way(void* buf, uint64_t alloc_size)
         exit(-1);
     }
 
-    int ret = register_range_with_wp(fd, buf, alloc_size);
+    int ret = register_range_with_wp(fd, buf, alloc_size, sigbus);
     ret = protect_range(fd, buf, alloc_size);
 
-    g_wp_info = {
-        fd 
-#if EXTRA_CHECKS_ARE_FUN
-        , SENTINEL_VALUE
-#endif
-    };
+    if (ret) {
+        return ret;
+    }
 
-    pthread_t thread = {0};
-    if (pthread_create(&thread, NULL, listener_proc, &g_wp_info))
+    if (sigbus)
     {
-        printf("ERROR: listener thread creation failed!\n");
-        exit(-1);
+        register_handler(SIGBUS);
+        REGION_BASE = buf;
+        uffd_global = fd;
+    }
+    else
+    {
+        g_wp_info = {
+            fd 
+#if EXTRA_CHECKS_ARE_FUN
+            , SENTINEL_VALUE
+#endif
+        };
+
+        pthread_t thread = {0};
+        if (pthread_create(&thread, NULL, listener_proc, &g_wp_info))
+        {
+            printf("ERROR: listener thread creation failed!\n");
+            exit(-1);
+        }
     }
 
     return ret;
 }
 
-uint64_t rdtsc(){
-    unsigned int lo,hi;
-    __asm__ __volatile__ ("rdtsc" : "=a" (lo), "=d" (hi));
-    return ((uint64_t)hi << 32) | lo;
-}
-
 int initialize_page_tracker()
 {
-    PAGE_TRACKER = new char[PAGE_COUNT];
     for (int i = 0; i < PAGE_COUNT; i++)
     {
         PAGE_TRACKER[i] = 0;
+        FAULT_DELAY[i] = { 0 };
     }
 
     return 0;
@@ -419,10 +457,10 @@ class Tests
 public:
     static bool ensure_writes_succeeded(void* buf)
     {
-        for (uint64_t i = 0; i < ALLOC_SIZE; i++)
+        for (uint64_t i = 0; i < PAGE_COUNT; i++)
         {
-            char* cur = (char*)buf;
-            if (cur[i] != (char)0xAD)
+            char* cur = (char*)buf + (PAGE_SIZE * i);
+            if (*cur != (char)0xAD)
             {
                 printf("Sanity test ensure_writes_succeeded failed! Buffer wasn't set correctly!\n");
                 printf("i = %llu, value = %d\n", i, cur[i]);
@@ -446,43 +484,31 @@ public:
         return true;
     }
 
-    static uint64_t get_number_of_dirty_pages(uint64_t len)
-    {
-        uint64_t dirty_count = 0;
-        for (uint64_t i = 0; i < len; i++)
-        {
-            if (PAGE_TRACKER[i] == (char)1)
-            {
-                dirty_count++;
-            }
-        }
-
-        return dirty_count;
-    }
-
     static bool perform_full_write_checks(void* buf)
     {
         return ensure_writes_succeeded(buf) && ensure_pages_dirtied(PAGE_COUNT);
     }
 };
 
-uint64_t sequential_write_experiment(bool use_uffd)
+uint64_t sequential_write_experiment(enum test_mode mode)
 {
     void* buf = allocate_mem_with_mmap(ALLOC_SIZE);
     initialize_page_tracker();
 
-    fill_with_pattern_seq(buf, 0xEE, ALLOC_SIZE);
+    fill_with_pattern_seq(buf, 0xEE, PAGE_COUNT, false);
 
     int setup_ret;
-    if (use_uffd)
+    if (mode == M_UFFD_WP)
     {
-        printf("Performing sequential write experiment with UFFD\n");
-        setup_ret = set_up_uffd_way(buf, ALLOC_SIZE);
+        setup_ret = set_up_uffd_way(buf, ALLOC_SIZE, false);
     }
-    else
+    else if (mode == M_MPROTECT)
     {
-        printf("Performing sequential write experiment with SEGV\n");
-        setup_ret = set_up_segv_way(buf, ALLOC_SIZE);
+        setup_ret = set_up_way(buf, ALLOC_SIZE);
+    }
+    else if (mode == M_UFFD_WP_SIGBUS)
+    {
+        setup_ret = set_up_uffd_way(buf, ALLOC_SIZE, true);
     }
 
     if (setup_ret != 0)
@@ -498,7 +524,7 @@ uint64_t sequential_write_experiment(bool use_uffd)
 #endif
 
     // Perform sequential writes in the protected region.
-    fill_with_pattern_seq(buf, 0xAD, ALLOC_SIZE);
+    fill_with_pattern_seq(buf, 0xAD, PAGE_COUNT, true);
 
 #if USE_RDTSC
     uint64_t time_end = rdtsc();
@@ -523,135 +549,66 @@ uint64_t sequential_write_experiment(bool use_uffd)
     return elapsed;
 }
 
-uint64_t random_write_experiment(bool use_uffd, int number_writes, int clean_interval = 0)
+void write_data(const char *name)
 {
-    void* buf = allocate_mem_with_mmap(ALLOC_SIZE);
-    initialize_page_tracker();
+    int i;
+    FILE *file;
+    char fname[128];
+    struct fault_delay *p;
 
-    fill_with_pattern_seq(buf, 0xEE, ALLOC_SIZE);
+    snprintf(fname, 127, "result-%s.txt", name);
 
-    int setup_ret;
-    if (use_uffd)
-    {
-        printf("Performing random write experiment with UFFD. %d writes. ", number_writes);
-        if (clean_interval != 0)
-        {
-            printf("Reprotecting every %d writes.", clean_interval);
-        }
-        printf("\n");
-        setup_ret = set_up_uffd_way(buf, ALLOC_SIZE);
-    }
-    else
-    {
-        printf("Performing random write experiment with SEGV. %d writes. ", number_writes);
-        if (clean_interval != 0)
-        {
-            printf("Reprotecting every %d writes.", clean_interval);
-        }
-        printf("\n");
-        setup_ret = set_up_segv_way(buf, ALLOC_SIZE);
+    file = fopen(fname, "w");
+    if (!file) {
+        printf("ERROR: open file %s failed\n", fname);
+        return;
     }
 
-    if (setup_ret != 0)
-    {
-        printf("SETUP FAILED!\n");
-        exit(-1);
+    for (i = 0; i < PAGE_COUNT; i++) {
+        p = &FAULT_DELAY[i];
+        fprintf(file, "%ld, %ld, %ld\n",
+                (long)p->uffd_receive - (long)p->worker_write,
+                (long)p->uffd_resolve - (long)p->uffd_receive,
+                (long)p->worker_finish - (long)p->uffd_resolve);
     }
 
-#if USE_RDTSC
-    uint64_t time_start = rdtsc();
-#else
-    auto time_start = std::chrono::high_resolution_clock::now();
-#endif
+    fclose(file);
 
-    if (clean_interval > 0)
-    {
-        int remaining_writes = number_writes;
-        while (remaining_writes > 0)
-        {
-            // Perform random writes in the protected region.
-            n_random_writes(buf, 0xAD, ALLOC_SIZE, (remaining_writes > clean_interval) ? clean_interval : remaining_writes);
-            remaining_writes -= clean_interval;
-
-            if (use_uffd)
-            {
-                // TODO: This is gross! Get the fd another way.
-                protect_range(g_wp_info.fd, buf, ALLOC_SIZE);
-            }
-            else
-            {
-                protect_range_with_mprotect(buf, ALLOC_SIZE);
-            }
-            
-        }
-    }
-    else
-    {
-        // Perform random writes in the protected region.
-        n_random_writes(buf, 0xAD, ALLOC_SIZE, number_writes);
-    }
-
-#if USE_RDTSC
-    uint64_t time_end = rdtsc();
-    uint64_t elapsed = time_end-time_start;
-#else
-    auto time_end = std::chrono::high_resolution_clock::now();
-    uint64_t elapsed = std::chrono::duration_cast<std::chrono::microseconds>(time_end - time_start).count();
-#endif
-
-    int ret = ::munmap(buf, ALLOC_SIZE);
-    if (ret != 0)
-    {
-        printf("ERROR: munmap Failed!\n");
-    }
-
-    return elapsed;
+    printf("Data output to file '%s'\n", fname);
 }
 
-int main()
+void usage(char *name)
 {
-    printf("Userfaultfd Test Program\n");
+    printf("usage: %s <uffd-wp|uffd-wp-sigbus|mprotect>\n", name);
+    exit(1);
+}
 
-    //
-    // TEST 1: Sequential writes
-    //
-    uint64_t elapsed_uffd = sequential_write_experiment(true);
-    uint64_t elapsed_segv = sequential_write_experiment(false);
-    float pct_delta = (elapsed_uffd - elapsed_segv) / (float)elapsed_segv;
+int main(int argc, char *argv[])
+{
+    enum test_mode mode;
+    uint64_t delay;
 
-    printf("UFFD ticks elapsed: %" PRIu64 "u\n", elapsed_uffd);
-    printf("SEGV ticks elapsed: %" PRIu64 "u\n", elapsed_segv);
-    printf("UFFD way was %f%% %s.\n", 100.0 * pct_delta, pct_delta < 0 ? "faster" : "slower");
+    if (argc == 1) {
+        usage(argv[0]);
+    }
 
-    //
-    // TEST 2: 50000 random writes
-    //
-    elapsed_uffd = random_write_experiment(true, 50000);
-    uint64_t c_dirty_uffd = Tests::get_number_of_dirty_pages(PAGE_COUNT);
-    elapsed_segv = random_write_experiment(false, 50000);
-    uint64_t c_dirty_segv = Tests::get_number_of_dirty_pages(PAGE_COUNT);
-    pct_delta = (elapsed_uffd - elapsed_segv) / (float)elapsed_segv;
-    assert(c_dirty_segv && (c_dirty_segv == c_dirty_uffd));
+    if (!strcmp(argv[1], "uffd-wp")) {
+        mode = M_UFFD_WP;
+        printf("Testing with uffd-wp\n");
+    } else if (!strcmp(argv[1], "mprotect")) {
+        mode = M_MPROTECT;
+        printf("Testing with mprotect\n");
+    } else if (!strcmp(argv[1], "uffd-wp-sigbus")) {
+        mode = M_UFFD_WP_SIGBUS;
+        printf("Testing with uffd-wp-sigbus\n");
+    } else {
+        usage(argv[0]);
+    }
 
-    printf("UFFD ticks elapsed: %" PRIu64 "u\n", elapsed_uffd);
-    printf("SEGV ticks elapsed: %" PRIu64 "u\n", elapsed_segv);
-    printf("UFFD way was %f%% %s.\n", 100.0 * pct_delta, pct_delta < 0 ? "faster" : "slower");
+    delay = sequential_write_experiment(mode);
 
-    //
-    // TEST 3: 5000000 random writes, but we reprotect every 10000
-    //
-    elapsed_uffd = random_write_experiment(true, 5000000, 10000);
-    c_dirty_uffd = Tests::get_number_of_dirty_pages(PAGE_COUNT);
-    elapsed_segv = random_write_experiment(false, 5000000, 10000);
-    c_dirty_segv = Tests::get_number_of_dirty_pages(PAGE_COUNT);
-    assert(c_dirty_segv && (c_dirty_segv == c_dirty_uffd));
+    printf("total used time: %ld\n", delay);
 
-    pct_delta = (elapsed_uffd - elapsed_segv) / (float)elapsed_segv;
-
-    printf("UFFD ticks elapsed: %" PRIu64 "u\n", elapsed_uffd);
-    printf("SEGV ticks elapsed: %" PRIu64 "u\n", elapsed_segv);
-    printf("UFFD way was %f%% %s.\n", 100.0 * pct_delta, pct_delta < 0 ? "faster" : "slower");
-
-    printf("All experiments complete.\n");
+    write_data(argv[1]);
     return 0;
 }
